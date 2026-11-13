@@ -1,36 +1,52 @@
-// roblox-up-and-coming-forecast-01 — momentum-aware kernel forecast (Node 22, stdlib only).
+// roblox-up-and-coming-forecast-01 — v2: short-memory wide-diffusion occupancy table
+// (Node 22, stdlib only).
 //
-// Idea: the Up-and-Coming chart churns hard (the kit's own notes: the top 10 changed
-// in 42 of 44 consecutive archive read pairs, median 6 places), so a "nothing moves"
-// forecast bleeds log score. This program instead builds, for every game, a
-// recency-weighted distribution over places and scores it honestly:
+// v1 was a recency-weighted Gaussian kernel forecast (36h e-folding, sigma 2.6,
+// 0.65 named share): backtest -45.44 on the three held-out splits, vs the house
+// baseline's -54.54. v2 keeps the same skeleton but retunes it into what the
+// splits actually reward, after a ~1,500-config grid search on the identical
+// splits (train to Nov 3 / 5 / 6, score the remaining reads):
 //
-//   1. Every past read contributes a Gaussian kernel centred on the game's rank in
-//      that read, weighted by exp(-age / 36h) — recent reads dominate, old ones fade.
-//   2. The kernel centre is shifted by the game's recent momentum: rank velocity
-//      (places/day over its last 3 reads) plus log player-count growth, so a game
-//      climbing 20 -> 4 gets its mass pushed toward the top, and a fading game
-//      (e.g. #1 -> #6 over a week) gets its mass pushed down.
-//   3. Age-out decay: the chart only lists games published in the last 28 days.
-//      When the history carries a game's `created` date (the house recorder's
-//      reads do), mass is faded out from day 26 and nearly gone past day 28.
-//   4. Games missing from the latest read are faded (x0.3): 38 games in the kit
-//      history vanished and later reappeared, so they keep some mass, not none.
-//   5. A small boost (x1.15) for games also sitting in Top Trending's top 20 in
-//      the latest read: broad visibility is staying power.
-//   6. Each place is normalised to name only 0.65 of its probability, leaving
-//      0.35 unnamed for churn and brand-new entrants the history never saw.
-//      With ~90 unnamed games per place that is ~0.004 each — far above the
-//      log-score floor of 0.0001, so a surprise entrant costs ~-5.5, not -9.21.
+//   1. SHORT MEMORY. Half-life 6h instead of a 36h e-folding. The chart's top 10
+//      set turns over in days, and a game's rank a week ago says almost nothing
+//      about where it sits now; only the last ~day of reads carries real weight.
+//      (With the final history's hourly house reads this is still ~a day of
+//      reads; with the sparse archive reads it is effectively the last 1-2.)
+//   2. WIDE DIFFUSION. Kernel sigma 6 places instead of 2.6. Places churn hard
+//      (the kit's own notes: the top 10 changed in 42 of 44 consecutive read
+//      pairs, median 6 places), so one read's rank is a weak statement about a
+//      game's place three days out. A wide kernel spreads each observation over
+//      the whole top 10 instead of betting it stays within +-3 places.
+//   3. HALF NAMED, HALF HEDGED. NAMED_SHARE 0.5 instead of 0.65. The other half
+//      stays unnamed, spread over the ~90 games the forecast does not name at a
+//      place (~0.005 each) — so a surprise entrant costs ~-5.3, not the -9.21
+//      floor, and the named mass is spent only where the table is confident.
+//   4. PRUNE BELOW THE UNNAMED LEVEL. Rows below MIN_P 0.006 are dropped, and
+//      the mass they would have taken stays unnamed instead of being
+//      renormalised onto the survivors. Naming a game at p below the unnamed
+//      per-game probability (~0.005-0.01) is strictly worse than leaving it
+//      unnamed: if it is the actual occupant you score ln(p) instead of the
+//      higher ln(unnamed p). So tiny rows are left out on purpose.
+//   5. Momentum, age-out and trending-boost kept from v1, unchanged in spirit:
+//      a clamped rank-velocity / player-growth shift of the kernel centre, mass
+//      faded out as a game approaches the chart's 28-day age limit, games
+//      missing from the latest read faded x0.3, games in Top Trending's top 20
+//      boosted x1.15. The grid found these second-order (momentum 0 vs 0.35 vs
+//      0.7 moves the mean by ~0.1); they are kept because they help on the
+//      final's hourly reads, where velocity is measured over real hours.
 //
-// Calibration: on three held-out splits of the kit history (train to Nov 3 / 5 /
-// 6, score the remaining reads) this scores about -44 to -47 against the house
-// baseline's -52 to -56 on the same splits — roughly 9-11 log points better.
-// Current-chart context (Nov 12-13 trackers): Do Not Stop. leads, Bloody Ragdoll
-// Physics and Hyper Realistic Ragdoll chase, Survive Your Ideas still holds
-// ~50k playing, South Hell has faded to the 30s-40s. The program does not hardcode
-// any of that: it reads whatever history the grader hands it, so the same code
-// forecasts from the final (hourly, house-recorder) history.
+// Backtest (identical splits, spec-exact local scorer, measured by running this
+// file on the truncated histories): v2 -42.64 mean
+// [-44.22, -43.12, -40.59] vs v1 -45.44 [-46.51, -46.35, -43.47] — +2.80 log
+// points, better on all three splits — and vs the house baseline's -54.54.
+// The improvement is a broad plateau (HL 4-8h, sigma 5-8, named 0.45-0.55 all
+// score -42.4 to -42.9), not a single lucky point, so the middle of the plateau
+// is used rather than the argmax. Two-stage set/place models, Laplace kernels,
+// timescale mixtures and persistence blends were all tried and scored worse.
+//
+// The program does not hardcode any game id, name, or chart state: it reads
+// whatever history the grader hands it, so the same code forecasts from the
+// final (hourly, house-recorder) history.
 //
 // Run: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
@@ -40,12 +56,12 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// --- Tuned constants (see header; chosen on held-out splits, not on the full history) ---
-const TAU_MS = 36 * 3600 * 1000; // recency half-life scale for read weights
-const KERNEL_SIGMA = 2.6; // places; spread of one read's kernel over places
-const NAMED_SHARE = 0.65; // per-place probability mass we name; rest stays unnamed
+// --- Tuned constants (grid-searched on the three held-out splits; see header) ---
+const HALF_LIFE_MS = 6 * 3600 * 1000; // recency half-life for read weights
+const KERNEL_SIGMA = 6; // places; wide spread of one read's kernel over places
+const NAMED_SHARE = 0.5; // per-place probability mass we name; rest stays unnamed
 const MOMENTUM_WEIGHT = 0.35; // how much recent rank/player momentum shifts a kernel
-const MIN_P = 0.004; // drop rows below this (keeps the file small and honest)
+const MIN_P = 0.006; // drop rows below this (about the unnamed per-game level)
 const MAX_ROWS_PER_PLACE = 100;
 const MISSING_LATEST_DECAY = 0.3; // game absent from the latest read
 const TRENDING_BOOST = 1.15; // game in latest Top Trending top 20
@@ -165,13 +181,14 @@ function momentumShift(
   return clamp(shift, -3, 3);
 }
 
-// Accumulate the kernel mass: mass[(universe_id, place)].
+// Accumulate the occupancy mass: mass[(universe_id, place)].
 const mass = new Map<string, number>();
 function addMass(universeId: number, place: number, value: number): void {
   const key = `${universeId}|${place}`;
   mass.set(key, (mass.get(key) ?? 0) + value);
 }
 
+const invTwoSigmaSq = 1 / (2 * KERNEL_SIGMA * KERNEL_SIGMA);
 for (const [universeId, series] of seriesById) {
   const shift = momentumShift(series, endTime);
   const gameMultiplier =
@@ -179,21 +196,24 @@ for (const [universeId, series] of seriesById) {
     (lastIds.has(universeId) ? 1 : MISSING_LATEST_DECAY) *
     (trendingIds.has(universeId) ? TRENDING_BOOST : 1);
   for (const obs of series) {
-    const weight = Math.exp(-(endTime - obs.t) / TAU_MS);
-    if (weight < 0.01) continue;
+    // Half-life weighting: a read 6h old counts half, 12h old a quarter, and
+    // anything older than ~2 days is negligible (weight < 0.005 is skipped).
+    const weight = Math.pow(0.5, (endTime - obs.t) / HALF_LIFE_MS);
+    if (weight < 0.005) continue;
     // Only the freshest reads (last 48h) get the momentum shift applied.
     const appliedShift = obs.t >= endTime - 48 * 3600 * 1000 ? shift : 0;
     const centre = obs.rank - appliedShift;
     for (let place = 1; place <= places; place++) {
-      const z = (place - centre) / KERNEL_SIGMA;
-      const kernel = Math.exp(-0.5 * z * z);
+      const z = place - centre;
+      const kernel = Math.exp(-z * z * invTwoSigmaSq);
       if (kernel < 0.02) continue;
       addMass(universeId, place, weight * kernel * gameMultiplier);
     }
   }
 }
 
-// Normalise each place to NAMED_SHARE, prune tiny rows, cap rows per place.
+// Normalise each place to NAMED_SHARE, prune rows below MIN_P (their mass stays
+// unnamed — see header point 4 — it is NOT renormalised onto the survivors).
 interface ProbRow {
   universe_id: number;
   place: number;
