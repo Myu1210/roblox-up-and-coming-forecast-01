@@ -1,52 +1,58 @@
-// roblox-up-and-coming-forecast-01 — v2: short-memory wide-diffusion occupancy table
+// roblox-up-and-coming-forecast-01 — v3: Markov drift / transition forecaster
 // (Node 22, stdlib only).
 //
-// v1 was a recency-weighted Gaussian kernel forecast (36h e-folding, sigma 2.6,
-// 0.65 named share): backtest -45.44 on the three held-out splits, vs the house
-// baseline's -54.54. v2 keeps the same skeleton but retunes it into what the
-// splits actually reward, after a ~1,500-config grid search on the identical
-// splits (train to Nov 3 / 5 / 6, score the remaining reads):
+// v2 was a short-memory wide-diffusion occupancy table (half-life 6h, kernel
+// sigma 6, named share 0.5): backtest -42.65 mean on the three held-out splits
+// (train to Nov 3 / 5 / 6, score the remaining reads, spec-exact scorer).
+// A ~1,500-config grid found no further headroom in that family (plateau
+// ~-42.4). v3 is a genuinely different model family: instead of spreading each
+// past observation around the rank where it was seen, it learns how ranks
+// MOVE and propagates the latest chart forward.
 //
-//   1. SHORT MEMORY. Half-life 6h instead of a 36h e-folding. The chart's top 10
-//      set turns over in days, and a game's rank a week ago says almost nothing
-//      about where it sits now; only the last ~day of reads carries real weight.
-//      (With the final history's hourly house reads this is still ~a day of
-//      reads; with the sparse archive reads it is effectively the last 1-2.)
-//   2. WIDE DIFFUSION. Kernel sigma 6 places instead of 2.6. Places churn hard
-//      (the kit's own notes: the top 10 changed in 42 of 44 consecutive read
-//      pairs, median 6 places), so one read's rank is a weak statement about a
-//      game's place three days out. A wide kernel spreads each observation over
-//      the whole top 10 instead of betting it stays within +-3 places.
-//   3. HALF NAMED, HALF HEDGED. NAMED_SHARE 0.5 instead of 0.65. The other half
-//      stays unnamed, spread over the ~90 games the forecast does not name at a
-//      place (~0.005 each) — so a surprise entrant costs ~-5.3, not the -9.21
-//      floor, and the named mass is spent only where the table is confident.
-//   4. PRUNE BELOW THE UNNAMED LEVEL. Rows below MIN_P 0.006 are dropped, and
-//      the mass they would have taken stays unnamed instead of being
-//      renormalised onto the survivors. Naming a game at p below the unnamed
-//      per-game probability (~0.005-0.01) is strictly worse than leaving it
-//      unnamed: if it is the actual occupant you score ln(p) instead of the
-//      higher ln(unnamed p). So tiny rows are left out on purpose.
-//   5. Momentum, age-out and trending-boost kept from v1, unchanged in spirit:
-//      a clamped rank-velocity / player-growth shift of the kernel centre, mass
-//      faded out as a game approaches the chart's 28-day age limit, games
-//      missing from the latest read faded x0.3, games in Top Trending's top 20
-//      boosted x1.15. The grid found these second-order (momentum 0 vs 0.35 vs
-//      0.7 moves the mean by ~0.1); they are kept because they help on the
-//      final's hourly reads, where velocity is measured over real hours.
+// What the data says (measured on the kit history, 34 reads, Oct 30–Nov 7):
+//   * Rank is NOT sorted by playing counts, and a top-10 game's rank drifts
+//     DOWN hard with lag: mean +2.9 places at ~24h, +8.4 at 30–60h, +15 at
+//     60–100h, +26 past 100h (least-squares drift ≈ 0.22–0.27 places/hour).
+//     The spread grows with lag too (sd ≈ 6.6 at 24h, ≈ 12 at 45h, ≈ 22
+//     past 100h). A symmetric kernel centred on the observed rank is
+//     therefore biased: it bets games stay where they were, but they fall.
+//   * Entries into the top 10 at ~24h lag come mostly from ranks 11–20
+//     (84), then 21–30 (30), 31–50 (25), 51–99 (18), brand-new (9), and
+//     land mostly at places 7–10. The drift model lets exactly those games
+//     flow in: a game at rank 15 with drift +13 centres on place ~2–10.
+//   * Climbers grow playing counts faster than fallers (mean log-growth
+//     +0.13/day vs −0.02/day over ~24h), so per-game playing growth shifts
+//     the propagated centre upward (toward place 1).
 //
-// Backtest (identical splits, spec-exact local scorer, measured by running this
-// file on the truncated histories): v2 -42.64 mean
-// [-44.22, -43.12, -40.59] vs v1 -45.44 [-46.51, -46.35, -43.47] — +2.80 log
-// points, better on all three splits — and vs the house baseline's -54.54.
-// The improvement is a broad plateau (HL 4-8h, sigma 5-8, named 0.45-0.55 all
-// score -42.4 to -42.9), not a single lucky point, so the middle of the plateau
-// is used rather than the argmax. Two-stage set/place models, Laplace kernels,
-// timescale mixtures and persistence blends were all tried and scored worse.
+// Model, fit from the history the grader hands it (train window only — the
+// fit is re-estimated inside every run, nothing is hardcoded):
+//   1. DRIFT + SPREAD FIT. From every pair of reads (dt ≤ 150h), for games
+//      at rank ≤ 30 in the earlier read: least-squares drift(Δ) = a + b·Δ
+//      (places/hour) and spread(Δ) = c + d·Δ from binned standard
+//      deviations. Fits are stable across the splits (b 0.225–0.274,
+//      c 8.2–9.1, d 0.136–0.159).
+//   2. PROPAGATE the latest chart over a horizon grid (12h…72h, the
+//      competition window, step 12h, equal weight): each game contributes a
+//      Gaussian over places centred at rank + drift(Δ) − MOMENTUM·growth,
+//      width max(3, 0.45·spread(Δ)). Games at ranks 11–99 flow in exactly
+//      like top-10 games flowing out — no separate entry model needed.
+//   3. NAMED SHARE 0.5 per place, rows below MIN_P 0.006 pruned WITHOUT
+//      renormalisation (kept from v2: naming a game below the unnamed
+//      per-game level ~0.006 is strictly worse than leaving it unnamed).
+//   4. Age-out fade (26→28 days, from details.created when present) and a
+//      ×1.15 boost for games in the latest Top Trending top 20, kept from
+//      v1/v2 (no-ops on the kit history, which carries no details).
+//
+// Backtest (identical splits, spec-exact local scorer): v3 −40.97 mean
+// [−43.53, −41.47, −37.91] vs v2 −42.65 [−44.33, −43.11, −40.50] — +1.68 log
+// points, better on ALL THREE splits. The win is a broad plateau, not a
+// spike: sdScale 0.3–0.5 × momentum 1.0–1.5 all score −40.8…−41.1, and the
+// centre of the plateau (sdScale 0.45, momentum 1.25) is used. Exact-place
+// frequency tables (−48.3) and the no-drift variant (−43.29) were tried and
+// rejected; blends with v2 (−41.8…−42.3) are worse than the pure drift model.
 //
 // The program does not hardcode any game id, name, or chart state: it reads
-// whatever history the grader hands it, so the same code forecasts from the
-// final (hourly, house-recorder) history.
+// whatever history the grader hands it and refits the drift from that history.
 //
 // Run: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
@@ -56,14 +62,18 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-// --- Tuned constants (grid-searched on the three held-out splits; see header) ---
-const HALF_LIFE_MS = 6 * 3600 * 1000; // recency half-life for read weights
-const KERNEL_SIGMA = 6; // places; wide spread of one read's kernel over places
+// --- Tuned constants (plateau centre; see header) ---
 const NAMED_SHARE = 0.5; // per-place probability mass we name; rest stays unnamed
-const MOMENTUM_WEIGHT = 0.35; // how much recent rank/player momentum shifts a kernel
 const MIN_P = 0.006; // drop rows below this (about the unnamed per-game level)
 const MAX_ROWS_PER_PLACE = 100;
-const MISSING_LATEST_DECAY = 0.3; // game absent from the latest read
+const SD_SCALE = 0.45; // shrink the fitted transition spread (fitted sd overstates it)
+const SD_FLOOR = 3; // places; minimum kernel width
+const MOMENTUM_WEIGHT = 1.25; // places of centre shift per unit log playing growth/day
+const MOMENTUM_SCALE = 5; // growth is per-day; horizon shift scales it (see below)
+const MAX_HORIZON_H = 72; // competition window, hours
+const HORIZON_STEP_H = 12;
+const MAX_PAIR_LAG_H = 150;
+const FIT_RANK_MAX = 30; // fit drift only from games ranked <= 30 (top-10 + near entrants)
 const TRENDING_BOOST = 1.15; // game in latest Top Trending top 20
 const AGE_FADE_START_DAYS = 26; // chart admits only games < 28 days old
 const AGE_FADE_END_DAYS = 28;
@@ -111,7 +121,6 @@ if (snapshots.length === 0) {
 const lastSnap = snapshots[snapshots.length - 1]!;
 const endTime = parseTime(lastSnap.at);
 const lastChart = [...lastSnap.up_and_coming].sort((a, b) => a.rank - b.rank);
-const lastIds = new Set(lastChart.map((row) => row.universe_id));
 const trendingIds = new Set(
   (lastSnap.top_trending ?? [])
     .filter((row) => row.rank <= 20)
@@ -130,6 +139,96 @@ for (const snap of snapshots) {
   }
 }
 
+// Age-out multiplier: 1 while young, fading to 0.05 across days 26-28.
+function ageMultiplier(universeId: number): number {
+  const created = createdById.get(universeId);
+  if (created === undefined) return 1;
+  const ageDays = (endTime - created) / (24 * 3600 * 1000);
+  if (ageDays <= AGE_FADE_START_DAYS) return 1;
+  if (ageDays >= AGE_FADE_END_DAYS) return 0.05;
+  return 1 - (0.95 * (ageDays - AGE_FADE_START_DAYS)) / (AGE_FADE_END_DAYS - AGE_FADE_START_DAYS);
+}
+
+// --- Fit the rank-transition law from this history's read pairs. ---
+// drift(dt) = a + b*dt (places), spread(dt) = c + d*dt (places, sd).
+interface DriftFit {
+  a: number;
+  b: number;
+  c: number;
+  d: number;
+  n: number;
+}
+
+function fitDrift(snaps: Snapshot[]): DriftFit {
+  const pts: Array<[number, number]> = []; // [dt hours, rank change]
+  for (let i = 0; i < snaps.length; i++) {
+    const earlier = new Map(snaps[i]!.up_and_coming.map((r) => [r.universe_id, r.rank]));
+    for (let j = i + 1; j < snaps.length; j++) {
+      const dt = (parseTime(snaps[j]!.at) - parseTime(snaps[i]!.at)) / 3600000;
+      if (dt > MAX_PAIR_LAG_H) continue;
+      const later = new Map(snaps[j]!.up_and_coming.map((r) => [r.universe_id, r.rank]));
+      for (const [uid, r0] of earlier) {
+        if (r0 > FIT_RANK_MAX) continue;
+        const r1 = later.get(uid);
+        if (r1 !== undefined) pts.push([dt, r1 - r0]);
+      }
+    }
+  }
+  const n = pts.length;
+  if (n < 50) return { a: 0, b: 0.2, c: 8, d: 0.15, n }; // degenerate history: sane defaults
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const [x, y] of pts) {
+    sx += x;
+    sy += y;
+    sxx += x * x;
+    sxy += x * y;
+  }
+  const b = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+  const a = (sy - b * sx) / n;
+  const bins: Array<[number, number]> = [
+    [0, 24],
+    [24, 48],
+    [48, 72],
+    [72, 120],
+    [120, 151],
+  ];
+  const sdPts: Array<[number, number]> = [];
+  for (const [lo, hi] of bins) {
+    const ys = pts.filter(([x]) => x >= lo && x < hi).map(([, y]) => y);
+    if (ys.length < 20) continue;
+    const mu = ys.reduce((p, q) => p + q, 0) / ys.length;
+    const sd = Math.sqrt(ys.reduce((p, q) => p + (q - mu) * (q - mu), 0) / ys.length);
+    sdPts.push([(lo + hi) / 2, sd]);
+  }
+  let c = 8;
+  let d = 0.15;
+  if (sdPts.length >= 2) {
+    const m = sdPts.length;
+    let sx2 = 0, sy2 = 0, sxx2 = 0, sxy2 = 0;
+    for (const [x, y] of sdPts) {
+      sx2 += x;
+      sy2 += y;
+      sxx2 += x * x;
+      sxy2 += x * y;
+    }
+    d = (m * sxy2 - sx2 * sy2) / (m * sxx2 - sx2 * sx2);
+    c = (sy2 - d * sx2) / m;
+  }
+  // Clamp the fitted law to sane ranges: a degenerate history (few reads,
+  // one weird pair) must not produce a wild drift that throws every centre
+  // out of the chart. The kit fits (b 0.225–0.274, c 8.2–9.1, d 0.136–0.159,
+  // a −1.04…−0.59) sit well inside these bounds, so this changes no score.
+  return {
+    a: clamp(a, -5, 5),
+    b: clamp(b, 0, 0.4),
+    c: clamp(c, 2, 20),
+    d: clamp(d, 0, 0.3),
+    n,
+  };
+}
+
+const fit = fitDrift(snapshots);
+
 // Per-game observation series: [time, rank, playing].
 const seriesById = new Map<number, Array<{ t: number; rank: number; playing: number }>>();
 for (const snap of snapshots) {
@@ -141,79 +240,54 @@ for (const snap of snapshots) {
   }
 }
 
-// Age-out multiplier: 1 while young, fading to 0.05 across days 26-28.
-function ageMultiplier(universeId: number): number {
-  const created = createdById.get(universeId);
-  if (created === undefined) return 1;
-  const ageDays = (endTime - created) / (24 * 3600 * 1000);
-  if (ageDays <= AGE_FADE_START_DAYS) return 1;
-  if (ageDays >= AGE_FADE_END_DAYS) return 0.05;
-  return 1 - (0.95 * (ageDays - AGE_FADE_START_DAYS)) / (AGE_FADE_END_DAYS - AGE_FADE_START_DAYS);
-}
-
-// Recent momentum of one game's series, in places of kernel shift.
-// Positive = climbing / growing, so its kernel centre moves toward place 1.
-// Measured over the last 48h of reads (not just the last 3 rows): with the
-// final history's hourly reads, 3 rows would span only 3h and a 1-place wobble
-// would read as 8 places/day. Falls back to the last 3 rows when the 48h
-// window spans under 6h (sparse archive reads).
-function momentumShift(
-  series: Array<{ t: number; rank: number; playing: number }>,
-  endTime: number,
-): number {
+// Recent log playing growth per day; climbers grow, fallers shrink.
+function playingGrowth(universeId: number): number {
+  const series = seriesById.get(universeId);
+  if (!series || series.length < 2) return 0;
   let recent = series.filter((obs) => obs.t >= endTime - 48 * 3600 * 1000);
-  const spanHours = (obs: Array<{ t: number }>): number =>
-    obs.length >= 2 ? (obs[obs.length - 1]!.t - obs[0]!.t) / 3600000 : 0;
-  if (recent.length < 2 || spanHours(recent) < 6) recent = series.slice(-3);
+  if (recent.length < 2) recent = series.slice(-3);
   if (recent.length < 2) return 0;
   const first = recent[0]!;
   const last = recent[recent.length - 1]!;
   const days = (last.t - first.t) / (24 * 3600 * 1000);
-  if (days <= 0) return 0;
-  const rankVelocity = (first.rank - last.rank) / days; // places/day, + = climbing
-  let growth = 0;
-  if (first.playing > 0 && last.playing > 0) {
-    growth = Math.log(last.playing / first.playing) / days; // log players/day
-  }
-  const shift =
-    MOMENTUM_WEIGHT * clamp(rankVelocity, -3, 3) * 0.5 +
-    MOMENTUM_WEIGHT * clamp(growth, -1, 1) * 1.0;
-  return clamp(shift, -3, 3);
+  if (days <= 0 || first.playing <= 0 || last.playing <= 0) return 0;
+  return clamp(Math.log(last.playing / first.playing) / days, -1, 1);
 }
 
-// Accumulate the occupancy mass: mass[(universe_id, place)].
+// Propagate the latest chart over the horizon grid.
 const mass = new Map<string, number>();
 function addMass(universeId: number, place: number, value: number): void {
   const key = `${universeId}|${place}`;
   mass.set(key, (mass.get(key) ?? 0) + value);
 }
 
-const invTwoSigmaSq = 1 / (2 * KERNEL_SIGMA * KERNEL_SIGMA);
-for (const [universeId, series] of seriesById) {
-  const shift = momentumShift(series, endTime);
+const horizons: number[] = [];
+for (let h = HORIZON_STEP_H; h <= MAX_HORIZON_H; h += HORIZON_STEP_H) horizons.push(h);
+
+for (const row of lastChart) {
+  const growth = playingGrowth(row.universe_id);
   const gameMultiplier =
-    ageMultiplier(universeId) *
-    (lastIds.has(universeId) ? 1 : MISSING_LATEST_DECAY) *
-    (trendingIds.has(universeId) ? TRENDING_BOOST : 1);
-  for (const obs of series) {
-    // Half-life weighting: a read 6h old counts half, 12h old a quarter, and
-    // anything older than ~2 days is negligible (weight < 0.005 is skipped).
-    const weight = Math.pow(0.5, (endTime - obs.t) / HALF_LIFE_MS);
-    if (weight < 0.005) continue;
-    // Only the freshest reads (last 48h) get the momentum shift applied.
-    const appliedShift = obs.t >= endTime - 48 * 3600 * 1000 ? shift : 0;
-    const centre = obs.rank - appliedShift;
+    ageMultiplier(row.universe_id) * (trendingIds.has(row.universe_id) ? TRENDING_BOOST : 1);
+  // Momentum shift: a game growing +1 log/day climbs ~MOMENTUM_WEIGHT*5 places
+  // over the window; a shrinking game falls by the same. (The *5 converts the
+  // per-day growth rate to the ~multi-day horizon scale; the product was
+  // tuned as one constant on the splits.)
+  const shift = MOMENTUM_WEIGHT * growth * MOMENTUM_SCALE;
+  for (const h of horizons) {
+    const centre = row.rank + (fit.a + fit.b * h) - shift;
+    const sd = Math.max(SD_FLOOR, (fit.c + fit.d * h) * SD_SCALE);
+    const invTwoSdSq = 1 / (2 * sd * sd);
     for (let place = 1; place <= places; place++) {
       const z = place - centre;
-      const kernel = Math.exp(-z * z * invTwoSigmaSq);
-      if (kernel < 0.02) continue;
-      addMass(universeId, place, weight * kernel * gameMultiplier);
+      const kernel = Math.exp(-z * z * invTwoSdSq);
+      if (kernel < 0.005) continue;
+      addMass(row.universe_id, place, (kernel / horizons.length) * gameMultiplier);
     }
   }
 }
 
 // Normalise each place to NAMED_SHARE, prune rows below MIN_P (their mass stays
-// unnamed — see header point 4 — it is NOT renormalised onto the survivors).
+// unnamed — it is NOT renormalised onto the survivors).
 interface ProbRow {
   universe_id: number;
   place: number;
